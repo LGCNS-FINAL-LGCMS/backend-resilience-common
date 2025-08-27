@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 6s # 6초마다 메트릭 수집
+
+scrape_configs:
+  - job_name: 'spring-micrometer'
+    metrics_path: '/actuator/prometheus' # 우리 애플리케이션의 메트릭 엔드포인트
+    static_configs:
+      - targets: ['host.docker.internal:8080'] # Docker 컨테이너에서 호스트 PC의 애플리케이션에 접근
