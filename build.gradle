@@ -1,5 +1,6 @@
 plugins {
-    id 'java'
+    id 'java-library'
+    id 'maven-publish'
     id 'org.springframework.boot' version '3.5.5'
     id 'io.spring.dependency-management' version '1.1.7'
 }
@@ -7,6 +8,22 @@ plugins {
 group = 'com.lgcms'
 version = '0.1'
 description = 'resilience-common'
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            // 파일 상단에 정의된 group, name, version 값을 사용합니다.
+            groupId = project.group
+            artifactId = project.name  // 프로젝트 이름(폴더명)을 artifactId로 사용
+            version = project.version
+
+            from components.java
+        }
+    }
+    repositories {
+        mavenLocal()
+    }
+}
 
 java {
     toolchain {
@@ -23,20 +40,20 @@ ext {
 }
 
 dependencies {
-    //    레질리언스4j
-    implementation("io.github.resilience4j:resilience4j-spring-boot3:2.2.0")
-    implementation("io.github.resilience4j:resilience4j-all")
-
-    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    // Spring Boot AOP
     implementation 'org.springframework.boot:spring-boot-starter-aop'
-    implementation 'org.projectlombok:lombok'
-    implementation 'org.springframework.boot:spring-boot-starter-web'
 
-    //    시각화 용
-    implementation("io.micrometer:micrometer-registry-prometheus")
+    // Resilience4j
+    implementation 'io.github.resilience4j:resilience4j-spring-boot2:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-circuitbreaker:2.2.0'
+    implementation 'io.github.resilience4j:resilience4j-retry:2.2.0'
 
-    testImplementation 'org.springframework.boot:spring-boot-starter-test'
-    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // Feign Client (Feign 인터페이스에 적용할 것이므로)
+    implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'
+
+    // Lombok (Optional)
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
 }
 
 dependencyManagement {
