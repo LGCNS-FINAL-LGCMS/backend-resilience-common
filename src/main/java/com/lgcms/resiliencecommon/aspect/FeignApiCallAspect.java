@@ -19,6 +19,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.lang.reflect.Method;
+import java.util.Arrays;
 
 @Aspect
 @Component
@@ -57,40 +58,73 @@ public class FeignApiCallAspect {
                     pjp.getSignature().getName(), throwable);
             String fallbackMethodName = feignApiCall.fallbackMethod();
 
-            // DEFAULT면 execute로
+            // 1. "DEFAULT" 라고 명시적으로 요청한 경우, 기본 폴백 실행
             if ("DEFAULT".equals(fallbackMethodName)) {
-                return defaultResilienceFallback.execute(throwable);
+                log.info("Explicit 'DEFAULT' fallback requested. Executing default fallback...");
+                return defaultResilienceFallback.execute2(throwable);
             }
-            // 사용자가 직접 설정할 경우 이것이 동작합니다.
-            else if (StringUtils.hasText(fallbackMethodName)) {
-                Method fallbackMethod = findFallbackMethod(pjp, fallbackMethodName);
+
+            // 2. 다른 이름의 커스텀 폴백을 명시적으로 요청한 경우, 해당 폴백 찾아 실행
+            if (StringUtils.hasText(fallbackMethodName)) {
+                log.info("Custom fallback method '{}' requested. Attempting to find and execute...", fallbackMethodName);
+                Method fallbackMethod = findFallbackMethod(pjp, fallbackMethodName, throwable);
                 if (fallbackMethod != null) {
-                    return fallbackMethod.invoke(pjp.getTarget(), throwable);
+                    if (fallbackMethod.getParameterCount() == pjp.getArgs().length) {
+                        return fallbackMethod.invoke(pjp.getTarget(), pjp.getArgs());
+                    } else {
+                        Object[] fallbackArgs = Arrays.copyOf(pjp.getArgs(), pjp.getArgs().length + 1);
+                        fallbackArgs[fallbackArgs.length - 1] = throwable;
+                        return fallbackMethod.invoke(pjp.getTarget(), fallbackArgs);
+                    }
                 }
             }
 
-            // 폴백이 지정되지 않은 경우
+            // 3. fallbackMethod를 지정하지 않았거나, 지정된 커스텀 폴백을 찾지 못한 경우 -> 원래 예외를 그냥 던짐
+            log.warn("No fallback method specified or the specified one was not found. Re-throwing original exception.");
             throw throwable;
         }
     }
 
 
+    /**
+     * FeignClient의 특성을 고려하여 인터페이스와 구현 클래스 모두를 검색합니다.
+     * 1. 원본 메서드와 시그니처가 같은 폴백 메서드를 먼저 찾음
+     * 2. 없다면, 원본 메서드 시그니처 + Throwable 파라미터를 갖는 폴백 메서드를 찾음
+     */
+    private Method findFallbackMethod(ProceedingJoinPoint pjp, String fallbackMethodName, Throwable cause) {
+        Method originalMethod = ((MethodSignature) pjp.getSignature()).getMethod();
+        Class<?>[] originalParamTypes = originalMethod.getParameterTypes();
+        Class<?> targetClass = pjp.getTarget().getClass();
 
-    private Method findFallbackMethod(ProceedingJoinPoint pjp, String fallbackMethodName) {
-        try {
-            // FeignClient 인터페이스의 default 메서드를 포함하여 검색
-            for (Class<?> iface : pjp.getTarget().getClass().getInterfaces()) {
+        // 검색할 파라미터 타입 배열 준비
+        Class<?>[] paramsForExactMatch = originalParamTypes;
+        Class<?>[] paramsWithThrowable = Arrays.copyOf(originalParamTypes, originalParamTypes.length + 1);
+        paramsWithThrowable[paramsWithThrowable.length - 1] = Throwable.class;
+
+        // 1. 인터페이스 먼저 검색 (FeignClient의 default 메서드 대응)
+        for (Class<?> iface : targetClass.getInterfaces()) {
+            try {
+                return iface.getMethod(fallbackMethodName, paramsForExactMatch);
+            } catch (NoSuchMethodException e) {
                 try {
-                    return iface.getMethod(fallbackMethodName, Throwable.class);
-                } catch (NoSuchMethodException e) {
-                    // 무시하고 다음 인터페이스 확인
+                    return iface.getMethod(fallbackMethodName, paramsWithThrowable);
+                } catch (NoSuchMethodException ex) {
+                    // 이 인터페이스에는 없으므로 다음 인터페이스로 넘어감
                 }
             }
-            return pjp.getTarget().getClass().getMethod(fallbackMethodName, Throwable.class);
+        }
+
+        // 2. 구현 클래스에서 검색 (별도의 @Component로 Fallback을 구현한 경우)
+        try {
+            return targetClass.getMethod(fallbackMethodName, paramsForExactMatch);
         } catch (NoSuchMethodException e) {
-            log.warn("Fallback method '{}' with Throwable parameter not found in class {} or its interfaces",
-                    fallbackMethodName, pjp.getTarget().getClass().getName());
-            return null;
+            try {
+                return targetClass.getMethod(fallbackMethodName, paramsWithThrowable);
+            } catch (NoSuchMethodException ex) {
+                log.warn("Fallback method '{}' not found with original or extended signature in class {} or its interfaces",
+                        fallbackMethodName, targetClass.getName());
+                return null;
+            }
         }
     }
 }
