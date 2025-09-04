@@ -1,6 +1,7 @@
 package com.lgcms.resiliencecommon.config;
 
 import io.github.resilience4j.bulkhead.*;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.core.IntervalFunction;
@@ -8,6 +9,9 @@ import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
 import io.github.resilience4j.timelimiter.TimeLimiterConfig;
 import io.github.resilience4j.timelimiter.TimeLimiterRegistry;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
@@ -29,7 +33,41 @@ import java.util.concurrent.TimeoutException;
  */
 @Configuration
 @EnableAspectJAutoProxy // AOP를 활성화합니다.
+@Slf4j
+@RequiredArgsConstructor
 public class ResilienceConfiguration {
+
+//        // RetryRegistry도 동일한 방식으로 적용합니다.
+//        retryRegistry.getEventPublisher()
+//                .onEntryAdded(entryAddedEvent -> {
+//                    Retry addedRetry = entryAddedEvent.getAddedEntry();
+//                    log.info("Attaching event listeners to new Retry: {}", addedRetry.getName());
+//
+//                    addedRetry.getEventPublisher()
+//                            .onRetry(event ->
+//                                    log.info("Retrying call. name: [{}], attempt: [{}], last exception: [{}]",
+//                                            event.getName(),
+//                                            event.getNumberOfRetryAttempts(),
+//                                            event.getLastThrowable().toString()
+//                                    )
+//                            );
+//                });
+//
+//        // BulkheadRegistry도 동일한 방식으로 적용합니다.
+//        bulkheadRegistry.getEventPublisher()
+//                .onEntryAdded(entryAddedEvent -> {
+//                    Bulkhead addedBulkhead = entryAddedEvent.getAddedEntry();
+//                    log.info("Attaching event listeners to new Bulkhead: {}", addedBulkhead.getName());
+//
+//                    addedBulkhead.getEventPublisher()
+//                            .onCallRejected(event ->
+//                                    log.warn("Bulkhead call rejected. name: [{}]", event.getBulkheadName())
+//                            );
+//                });
+
+
+
+
 
 //  서킷브레이크 설정
     /**
@@ -47,9 +85,6 @@ public class ResilienceConfiguration {
                 .slidingWindowSize(20) // 20번호출 기준
                 .build();
     }
-
-
-
 
     // 레지스트리에 빈 등록 해서 사용
     @Bean
@@ -110,6 +145,30 @@ public class ResilienceConfiguration {
         registry.addConfiguration("dbConnection", dbConnectionCircuitBreakerConfig);
         registry.addConfiguration("feign", feignCircuitbreakerConfig);
 
+        registry.getEventPublisher()
+                .onEntryAdded(entryAddedEvent -> {
+                    CircuitBreaker addedCircuitBreaker = entryAddedEvent.getAddedEntry();
+                    log.info("Attaching event listeners to new CircuitBreaker: {}", addedCircuitBreaker.getName());
+
+                    // 추가된 서킷 브레이커 인스턴스의 EventPublisher에 실제 상태 변경 리스너를 등록합니다.
+                    addedCircuitBreaker.getEventPublisher()
+                            .onStateTransition(event ->
+                                    log.warn("CircuitBreaker 상태 변경. 이름: [{}], 상태: 이 상태 [{}] 에서 [{}] 로",
+                                            event.getCircuitBreakerName(),
+                                            event.getStateTransition().getFromState(),
+                                            event.getStateTransition().getToState()
+                                    )
+                            )
+                            .onError(event ->
+                                    log.warn("CircuitBreaker 에러 발생. 이름: [{}], 듀레이션: {}ms, 에러: [{}]",
+                                            event.getCircuitBreakerName(),
+                                            event.getElapsedDuration().toMillis(),
+                                            event.getThrowable().toString()
+                                    )
+                            );
+                });
+
+
         return registry;
     }
 
@@ -137,15 +196,16 @@ public class ResilienceConfiguration {
                 .build();
 
         // 재시도 (maxAttempts 3번)
+        // waitDuration이랑 intervalFunction은 겹치면 안됩니다.
         RetryConfig feignRetryConfig = RetryConfig.custom()
                 .waitDuration(Duration.ofMillis(500))
-                .intervalFunction(IntervalFunction.ofExponentialBackoff(500, 2.0))
+//                .intervalFunction(IntervalFunction.ofExponentialBackoff(500, 2.0))
                 .build();
 
         RetryRegistry registry = RetryRegistry.ofDefaults();
         registry.addConfiguration("aiApi", aiApiRetryConfig);
         registry.addConfiguration("videoProcessing", videoProcessingRetryConfig);
-        registry.addConfiguration("feignRetryConfig", paymentRetryConfig);
+        registry.addConfiguration("feignRetryConfig", feignRetryConfig);
 //        registry.addConfiguration("payment", paymentRetryConfig);
         return registry;
     }
@@ -202,4 +262,6 @@ public class ResilienceConfiguration {
         registry.addConfiguration("payment", paymentTimeLimiterConfig);
         return registry;
     }
+
+
 }

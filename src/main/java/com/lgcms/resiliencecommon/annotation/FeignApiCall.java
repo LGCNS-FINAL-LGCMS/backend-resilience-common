@@ -48,7 +48,5 @@ public @interface FeignApiCall {
 //    // timelimiter 재설정
 //    long timeoutDurationMs() default -1L;
 
-    // bulkhead 설정
-    int maxConcurrentCalls() default -1;
-    long maxWaitDuration() default -1L;
+
 }

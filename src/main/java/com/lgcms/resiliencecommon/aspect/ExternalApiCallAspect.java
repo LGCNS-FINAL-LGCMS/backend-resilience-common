@@ -25,9 +25,11 @@ import org.springframework.util.StringUtils;
 import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-
+import java.util.function.Supplier;
 
 
 @Aspect
@@ -40,17 +42,28 @@ public class ExternalApiCallAspect {
     private final DefaultResilienceFallback defaultResilienceFallback;
     private final BulkheadRegistry bulkheadRegistry;
 
+
     @Around("@annotation(com.lgcms.resiliencecommon.annotation.ExternalApiCall)")
     public Object around(ProceedingJoinPoint pjp) throws Throwable {
         MethodSignature signature = (MethodSignature) pjp.getSignature();
         Method method = signature.getMethod();
         ExternalApiCall externalApiCall = method.getAnnotation(ExternalApiCall.class);
-        String configName = externalApiCall.name();
 
-        // 1. 어노테이션 속성을 반영하여 Resilience4j 객체들을 동적으로 생성
-        Retry retry = createDynamicRetry(externalApiCall, configName);
-        CircuitBreaker circuitBreaker = createDynamicCircuitBreaker(externalApiCall, configName);
-        Bulkhead bulkhead = createDynamicBulkhead(externalApiCall, configName);
+        // 캐시 키 생성
+        String cacheKey = generateCacheKey(signature.toLongString(), externalApiCall);
+
+        // Registry에 cacheKey로 된 인스턴스가 있으면 반환, 없으면 생성 후 등록하고 반환합니다.
+        // 이 과정에서 'onEntryAdded' 이벤트가 발생합니다.
+        Supplier<CircuitBreakerConfig> circuitBreakerConfigSupplier = () -> createDynamicCircuitBreakerConfig(externalApiCall);
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(cacheKey, circuitBreakerConfigSupplier);
+
+        Supplier<RetryConfig> retryConfigSupplier = () -> createDynamicRetryConfig(externalApiCall);
+        Retry retry = retryRegistry.retry(cacheKey, retryConfigSupplier);
+
+        Supplier<BulkheadConfig> bulkheadConfigSupplier = () -> createDynamicBulkheadConfig(externalApiCall);
+        Bulkhead bulkhead = bulkheadRegistry.bulkhead(cacheKey, bulkheadConfigSupplier);
+
+        String configName = externalApiCall.name();
 
         // 2. 원본 메소드 호출 (타임리미터 쓸거면 비동기로 바꿔서 Supplier를 쓴다. )
         CheckedSupplier<Object> originMethodCall = pjp::proceed;
@@ -65,60 +78,84 @@ public class ExternalApiCallAspect {
             return retriedCall.get();
         } catch (Throwable throwable) {
             Throwable originalCause = unwrapAsyncExceptions(throwable);
-            log.warn("Resilience4j모듈이 다음 메소드때문에 실패 '{}'. 이유: {}",
-                    pjp.getSignature().getName(), originalCause.toString());
+            log.warn("Resilience4j모듈이 다음 메소드때문에 실패 '{}'. 이유: {}, 메세지 : {}",
+                    pjp.getSignature().getName(), originalCause.toString(), throwable.getMessage());
             return handleFallback(pjp, externalApiCall.fallbackMethod(), originalCause);
         }
     }
 
-    //  Retry 어노테이션 동적 생성
-    private Retry createDynamicRetry(ExternalApiCall annotation, String configName) {
-        RetryConfig baseConfig = retryRegistry.getConfiguration(configName).orElse(RetryConfig.ofDefaults());
+    private String generateCacheKey(String methodSignature, ExternalApiCall annotation) {
+        // 어노테이션의 모든 속성값을 조합하여 고유성을 보장하고 객체 재사용
+        return methodSignature + "#" + annotation.name() +
+                "#" + annotation.failureRateThreshold() +
+                "#" + annotation.waitDurationInOpenState() +
+                "#" + annotation.permittedNumberOfCallsInHalfOpenState() +
+                "#" + annotation.slidingWindowSize() +
+                "#" + annotation.maxAttempts() +
+                "#" + annotation.intervalFunction() +
+                "#" + Arrays.toString(annotation.retryExceptions()) +
+                "#" + annotation.maxConcurrentCalls() +
+                "#" + annotation.maxWaitDuration();
+    }
+
+    private RetryConfig createDynamicRetryConfig(ExternalApiCall annotation) {
+        RetryConfig baseConfig = retryRegistry.getConfiguration(annotation.name()).orElse(RetryConfig.ofDefaults());
         RetryConfig.Builder<Object> builder = RetryConfig.from(baseConfig);
-        if (annotation.maxAttempts() != -1) {
-            builder.maxAttempts(annotation.maxAttempts());
-        }
-        if (annotation.intervalFunction() != -1){
-            builder.intervalFunction(IntervalFunction.ofExponentialBackoff(annotation.intervalFunction(), 2));
-        }
-        if (annotation.retryExceptions().length > 0) {
-            builder.retryExceptions(annotation.retryExceptions());
-        }
-
-        return Retry.of(configName + "-dynamic-" + System.nanoTime(), builder.build());
+        if (annotation.maxAttempts() != -1) builder.maxAttempts(annotation.maxAttempts());
+        if (annotation.intervalFunction() != -1) builder.intervalFunction(IntervalFunction.ofExponentialBackoff(Duration.ofMillis(annotation.intervalFunction()), 2));
+        if (annotation.retryExceptions().length > 0) builder.retryExceptions(annotation.retryExceptions());
+        return builder.build();
     }
 
-    // 어노테이션CircuitBreaker
-    private CircuitBreaker createDynamicCircuitBreaker(ExternalApiCall annotation, String configName) {
-        CircuitBreakerConfig baseConfig = circuitBreakerRegistry.getConfiguration(configName).orElse(CircuitBreakerConfig.ofDefaults());
+    private CircuitBreakerConfig createDynamicCircuitBreakerConfig(ExternalApiCall annotation) {
+        CircuitBreakerConfig baseConfig = circuitBreakerRegistry.getConfiguration(annotation.name()).orElse(CircuitBreakerConfig.ofDefaults());
         CircuitBreakerConfig.Builder builder = CircuitBreakerConfig.from(baseConfig);
-        if (annotation.failureRateThreshold() != -1.0f) {
-            builder.failureRateThreshold(annotation.failureRateThreshold());
-        }
-        if (annotation.waitDurationInOpenState() != -1) {
-            builder.waitDurationInOpenState(Duration.ofSeconds(annotation.waitDurationInOpenState()));
-        }
-        if (annotation.permittedNumberOfCallsInHalfOpenState() != -1){
-            builder.permittedNumberOfCallsInHalfOpenState(annotation.permittedNumberOfCallsInHalfOpenState());
-        }
-        if (annotation.slidingWindowSize() != -1) {
-            builder.slidingWindowSize(annotation.slidingWindowSize());
-        }
-        return CircuitBreaker.of(configName + "-dynamic-" + System.nanoTime(), builder.build());
+        if (annotation.failureRateThreshold() != -1.0f) builder.failureRateThreshold(annotation.failureRateThreshold());
+        if (annotation.waitDurationInOpenState() != -1) builder.waitDurationInOpenState(Duration.ofMillis(annotation.waitDurationInOpenState()));
+        if (annotation.permittedNumberOfCallsInHalfOpenState() != -1) builder.permittedNumberOfCallsInHalfOpenState(annotation.permittedNumberOfCallsInHalfOpenState());
+        if (annotation.slidingWindowSize() != -1) builder.slidingWindowSize(annotation.slidingWindowSize());
+        return builder.build();
     }
 
-//    어노테이션 bulkhead
-    private Bulkhead createDynamicBulkhead(ExternalApiCall annotation, String configName){
-        BulkheadConfig baseConfig = bulkheadRegistry.getConfiguration(configName).orElse(BulkheadConfig.ofDefaults());
+    private BulkheadConfig createDynamicBulkheadConfig(ExternalApiCall annotation){
+        BulkheadConfig baseConfig = bulkheadRegistry.getConfiguration(annotation.name()).orElse(BulkheadConfig.ofDefaults());
         BulkheadConfig.Builder builder = BulkheadConfig.from(baseConfig);
-        if (annotation.maxConcurrentCalls() != -1) {
-            builder.maxConcurrentCalls(annotation.maxConcurrentCalls());
-        }
-        if (annotation.maxWaitDuration() != -1L) {
-            builder.maxWaitDuration(Duration.ofMillis(annotation.maxWaitDuration()));
-        }
-        return Bulkhead.of(configName + "-dynamic-" + System.nanoTime(), builder.build());
+        if (annotation.maxConcurrentCalls() != -1) builder.maxConcurrentCalls(annotation.maxConcurrentCalls());
+        if (annotation.maxWaitDuration() != -1L) builder.maxWaitDuration(Duration.ofMillis(annotation.maxWaitDuration()));
+        return builder.build();
     }
+//    //  Retry 어노테이션 동적 생성
+//    private Retry createDynamicRetry(String cacheKey, ExternalApiCall annotation) {
+//        RetryConfig baseConfig = retryRegistry.getConfiguration(annotation.name()).orElse(RetryConfig.ofDefaults());
+//        RetryConfig.Builder<Object> builder = RetryConfig.from(baseConfig);
+//
+//        if (annotation.maxAttempts() != -1) builder.maxAttempts(annotation.maxAttempts());
+//        if (annotation.intervalFunction() != -1) builder.intervalFunction(IntervalFunction.ofExponentialBackoff(Duration.ofMillis(annotation.intervalFunction()), 2));
+//        if (annotation.retryExceptions().length > 0) builder.retryExceptions(annotation.retryExceptions());
+//
+//        return Retry.of(cacheKey, builder.build());
+//    }
+//
+//    private CircuitBreaker createDynamicCircuitBreaker(String cacheKey, ExternalApiCall annotation) {
+//        CircuitBreakerConfig baseConfig = circuitBreakerRegistry.getConfiguration(annotation.name()).orElse(CircuitBreakerConfig.ofDefaults());
+//        CircuitBreakerConfig.Builder builder = CircuitBreakerConfig.from(baseConfig);
+//
+//        if (annotation.failureRateThreshold() != -1.0f) builder.failureRateThreshold(annotation.failureRateThreshold());
+//        if (annotation.waitDurationInOpenState() != -1) builder.waitDurationInOpenState(Duration.ofMillis(annotation.waitDurationInOpenState()));
+//        if (annotation.permittedNumberOfCallsInHalfOpenState() != -1) builder.permittedNumberOfCallsInHalfOpenState(annotation.permittedNumberOfCallsInHalfOpenState());
+//        if (annotation.slidingWindowSize() != -1) builder.slidingWindowSize(annotation.slidingWindowSize());
+//
+//        return CircuitBreaker.of(cacheKey, builder.build());
+//    }
+//
+//    private Bulkhead createDynamicBulkhead(String cacheKey, ExternalApiCall annotation){
+//        BulkheadConfig baseConfig = bulkheadRegistry.getConfiguration(annotation.name()).orElse(BulkheadConfig.ofDefaults());
+//        BulkheadConfig.Builder builder = BulkheadConfig.from(baseConfig);
+//        if (annotation.maxConcurrentCalls() != -1) builder.maxConcurrentCalls(annotation.maxConcurrentCalls());
+//        if (annotation.maxWaitDuration() != -1L) builder.maxWaitDuration(Duration.ofMillis(annotation.maxWaitDuration()));
+//
+//        return Bulkhead.of(cacheKey, builder.build());
+//    }
 
     private Object handleFallback(ProceedingJoinPoint pjp, String fallbackMethodName, Throwable throwable) throws Throwable {
         if ("DEFAULT".equals(fallbackMethodName)) {
