@@ -2,12 +2,16 @@
 
 package com.lgcms.resiliencecommon.aspect;
 
+import com.lgcms.resiliencecommon.annotation.ExternalApiCall;
 import com.lgcms.resiliencecommon.annotation.FeignApiCall;
 import com.lgcms.resiliencecommon.fallback.DefaultResilienceFallback;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.core.IntervalFunction;
 import io.github.resilience4j.core.functions.CheckedSupplier;
 import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -18,8 +22,12 @@ import org.aspectj.lang.reflect.MethodSignature;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.time.Duration;
 import java.util.Arrays;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 
 @Aspect
 @Component
@@ -36,17 +44,19 @@ public class FeignApiCallAspect {
         MethodSignature signature = (MethodSignature) pjp.getSignature();
         Method method = signature.getMethod();
         FeignApiCall feignApiCall = method.getAnnotation(FeignApiCall.class);
+        String configName = feignApiCall.name();
 
         String instanceName = feignApiCall.name();
-        Retry retry = retryRegistry.retry(instanceName);
-        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(instanceName);
 
         // 원본 메서드 호출(pjp::proceed)을 CheckedSupplier로 준비합니다.
         CheckedSupplier<Object> originalMethodCall = pjp::proceed;
 
+        // 동적으로 생성
+        Retry retry = createDynamicRetry(feignApiCall, configName);
+        CircuitBreaker circuitBreaker = createDynamicCircuitBreaker(feignApiCall, configName);
+
         // 서킷 브레이커와 재시도 순서로 데코레이팅합니다. (재시도가 서킷 브레이커를 감싸도록)
-        CheckedSupplier<Object> decoratedSupplier = CircuitBreaker
-                .decorateCheckedSupplier(circuitBreaker, originalMethodCall);
+        CheckedSupplier<Object> decoratedSupplier = CircuitBreaker.decorateCheckedSupplier(circuitBreaker, originalMethodCall);
         decoratedSupplier = Retry.decorateCheckedSupplier(retry, decoratedSupplier);
 
         try {
@@ -54,35 +64,72 @@ public class FeignApiCallAspect {
             return decoratedSupplier.get();
         } catch (Throwable throwable) {
             // 리트라이 다 실패할시 이 블록이 동작 !
-            log.warn("Resilience4j execution failed for method '{}'. Initiating fallback...",
-                    pjp.getSignature().getName(), throwable);
-            String fallbackMethodName = feignApiCall.fallbackMethod();
+            Throwable originalCause = unwrapAsyncExceptions(throwable);
+            log.warn("Resilience4j모듈이 다음 메소드때문에 실패 '{}'. 이유: {}",
+                    pjp.getSignature().getName(), originalCause.toString());
+            return handleFallback(pjp, feignApiCall.fallbackMethod(), originalCause);
+        }
+    }
 
-            // 1. "DEFAULT" 라고 명시적으로 요청한 경우, 기본 폴백 실행
-            if ("DEFAULT".equals(fallbackMethodName)) {
-                log.info("Explicit 'DEFAULT' fallback requested. Executing default fallback...");
-                return defaultResilienceFallback.execute2(throwable);
-            }
+    private CircuitBreaker createDynamicCircuitBreaker(FeignApiCall annotation, String configName) {
+        CircuitBreakerConfig baseConfig = circuitBreakerRegistry.getConfiguration(configName).orElse(CircuitBreakerConfig.ofDefaults());
+        CircuitBreakerConfig.Builder builder = CircuitBreakerConfig.from(baseConfig);
+        if (annotation.failureRateThreshold() != -1.0f) {
+            builder.failureRateThreshold(annotation.failureRateThreshold());
+        }
+        if (annotation.waitDurationInOpenState() != -1) {
+            builder.waitDurationInOpenState(Duration.ofSeconds(annotation.waitDurationInOpenState()));
+        }
+        if (annotation.permittedNumberOfCallsInHalfOpenState() != -1){
+            builder.permittedNumberOfCallsInHalfOpenState(annotation.permittedNumberOfCallsInHalfOpenState());
+        }
+        if (annotation.slidingWindowSize() != -1) {
+            builder.slidingWindowSize(annotation.slidingWindowSize());
+        }
+        return CircuitBreaker.of(configName + "-dynamic-" + System.nanoTime(), builder.build());
+    }
 
-            // 2. 다른 이름의 커스텀 폴백을 명시적으로 요청한 경우, 해당 폴백 찾아 실행
-            if (StringUtils.hasText(fallbackMethodName)) {
-                log.info("Custom fallback method '{}' requested. Attempting to find and execute...", fallbackMethodName);
-                Method fallbackMethod = findFallbackMethod(pjp, fallbackMethodName, throwable);
-                if (fallbackMethod != null) {
-                    if (fallbackMethod.getParameterCount() == pjp.getArgs().length) {
-                        return fallbackMethod.invoke(pjp.getTarget(), pjp.getArgs());
-                    } else {
-                        Object[] fallbackArgs = Arrays.copyOf(pjp.getArgs(), pjp.getArgs().length + 1);
-                        fallbackArgs[fallbackArgs.length - 1] = throwable;
-                        return fallbackMethod.invoke(pjp.getTarget(), fallbackArgs);
-                    }
+    private Retry createDynamicRetry(FeignApiCall annotation, String configName) {
+        RetryConfig baseConfig = retryRegistry.getConfiguration(configName).orElse(RetryConfig.ofDefaults());
+        RetryConfig.Builder<Object> builder = RetryConfig.from(baseConfig);
+        if (annotation.maxAttempts() != -1) {
+            builder.maxAttempts(annotation.maxAttempts());
+        }
+        if (annotation.intervalFunction() != -1){
+            builder.intervalFunction(IntervalFunction.ofExponentialBackoff(annotation.intervalFunction(), 2));
+        }
+        if (annotation.retryExceptions().length > 0) {
+            builder.retryExceptions(annotation.retryExceptions());
+        }
+
+        return Retry.of(configName + "-dynamic-" + System.nanoTime(), builder.build());
+    }
+
+    private Object handleFallback(ProceedingJoinPoint pjp, String fallbackMethodName, Throwable throwable) throws Throwable {
+        // 1. "DEFAULT" 라고 명시적으로 요청한 경우, 기본 폴백 실행
+        if ("DEFAULT".equals(fallbackMethodName)) {
+            log.info("default fallback 실행");
+            return defaultResilienceFallback.execute2(throwable);
+        }
+
+        // 2. 다른 이름의 커스텀 폴백을 명시적으로 요청한 경우, 해당 폴백 찾아 실행
+        if (StringUtils.hasText(fallbackMethodName)) {
+            log.info("Custom fallback method '{}' requested. Attempting to find and execute...", fallbackMethodName);
+            Method fallbackMethod = findFallbackMethod(pjp, fallbackMethodName, throwable);
+            if (fallbackMethod != null) {
+                if (fallbackMethod.getParameterCount() == pjp.getArgs().length) {
+                    return fallbackMethod.invoke(pjp.getTarget(), pjp.getArgs());
+                } else {
+                    Object[] fallbackArgs = Arrays.copyOf(pjp.getArgs(), pjp.getArgs().length + 1);
+                    fallbackArgs[fallbackArgs.length - 1] = throwable;
+                    return fallbackMethod.invoke(pjp.getTarget(), fallbackArgs);
                 }
             }
-
-            // 3. fallbackMethod를 지정하지 않았거나, 지정된 커스텀 폴백을 찾지 못한 경우 -> 원래 예외를 그냥 던짐
-            log.warn("No fallback method specified or the specified one was not found. Re-throwing original exception.");
-            throw throwable;
         }
+
+        // 3. fallbackMethod를 지정하지 않았거나, 지정된 커스텀 폴백을 찾지 못한 경우 -> 원래 예외를 그냥 던짐
+        log.warn("폴백메소드가 없거나 지정한 커스텀 폴백을 찾지 못했습니다. Re-throwing original exception.");
+        throw throwable;
     }
 
 
@@ -126,5 +173,14 @@ public class FeignApiCallAspect {
                 return null;
             }
         }
+    }
+
+    private Throwable unwrapAsyncExceptions(Throwable throwable) {
+        if (throwable instanceof CompletionException || throwable instanceof ExecutionException) {
+            if (throwable.getCause() != null) {
+                return throwable.getCause();
+            }
+        }
+        return throwable;
     }
 }
