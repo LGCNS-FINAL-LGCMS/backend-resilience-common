@@ -55,7 +55,7 @@ dependencies {
     compileOnly 'org.projectlombok:lombok'
     annotationProcessor 'org.projectlombok:lombok'
 
-
+    compileOnly "io.github.resilience4j:resilience4j-micrometer"
 }
 
 dependencyManagement {
